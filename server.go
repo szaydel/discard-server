@@ -10,10 +10,21 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // Global counter channel to track lines across all connections
 var linecounter = make(chan WriterStats)
+var pCounterRecords = prometheus.NewCounter(prometheus.CounterOpts{
+	Name: "received_records_total",
+	Help: "The total number of records received and subsequently discarded",
+})
+var pCounterBytes = prometheus.NewCounter(prometheus.CounterOpts{
+	Name: "received_bytes_total",
+	Help: "The total number of bytes received and subsequently discarded",
+})
 
 func checkErr(err error) bool {
 	if err == nil {
@@ -97,6 +108,8 @@ func aggregator(c chan WriterStats, shutdown chan struct{}) {
 		case v := <-c:
 			counter.cur += v.nlines
 			counter.curBytes += v.nbytes
+			pCounterRecords.Add(float64(v.nlines))
+			pCounterBytes.Add(float64(v.nbytes))
 		case <-ticker.C:
 			prev := counter.prev
 			prevBytes := counter.prevBytes
@@ -133,6 +146,10 @@ func main() {
 		os.Exit(0)
 	}()
 
+	// Register counters with the Prometheus registry
+	prometheus.MustRegister(pCounterBytes)
+	prometheus.MustRegister(pCounterRecords)
+
 	go aggregator(linecounter, shutdown)
 
 	ln, err := net.Listen("tcp", ":5002")
@@ -143,6 +160,13 @@ func main() {
 	go func() {
 		if err := http.ListenAndServe(":6060", nil); err != nil {
 			log.Fatalf("pprof failed: %v", err)
+		}
+	}()
+
+	go func() {
+		http.Handle("/metrics", promhttp.Handler())
+		if err := http.ListenAndServe(":9094", nil); err != nil {
+			log.Fatalf("prom failed: %v", err)
 		}
 	}()
 
