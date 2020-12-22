@@ -130,7 +130,6 @@ func aggregator(c chan WriterStats, shutdown chan struct{}) {
 
 func main() {
 	// setLimit()
-	var connections []net.Conn
 	signalChan := make(chan os.Signal, 1)
 	shutdown := make(chan struct{})
 	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
@@ -139,10 +138,6 @@ func main() {
 		<-signalChan
 		log.Printf("Server is shutting down")
 		shutdown <- struct{}{}
-		for _, conn := range connections {
-			log.Printf("Closing conn to: %v", conn.RemoteAddr().String())
-			conn.Close()
-		}
 		os.Exit(0)
 	}()
 
@@ -183,14 +178,14 @@ func main() {
 		}
 
 		go handleConn(conn)
-		connections = append(connections, conn)
-		if len(connections)%100 == 0 {
-			log.Printf("Connection Count: %v", len(connections))
-		}
 	}
 }
 
 func handleConn(conn net.Conn) {
+	defer func() {
+		log.Printf("Closing connection %v -> %v", conn.RemoteAddr(), conn.LocalAddr())
+		conn.Close()
+	}()
 	w := &MockWriter{statsChan: linecounter}
 	for {
 		n, err := io.Copy(w, conn)
