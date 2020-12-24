@@ -1,6 +1,8 @@
 package main
 
 import (
+	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -15,6 +17,46 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+const (
+	DefaultReportInterval     = 10 * time.Second
+	DefaultLogIntervalReports = true
+	DefaultAddress            = ""
+	DefaultPort               = 5002
+	DefaultPprofPort          = 6060
+	DefaultMetricsPort        = 9094
+)
+
+type Configuration struct {
+	reportInterval     time.Duration
+	logIntervalReports bool
+	address            string
+	port               uint
+	pprofPort          uint
+	metricsPort        uint
+}
+
+func makeAddrString(addr string, port uint) string {
+	if len(addr) == 0 {
+		return fmt.Sprintf(":%d", port)
+	}
+	return fmt.Sprintf("%s:%d", addr, port)
+}
+
+func (c *Configuration) sinkAddrString() string {
+	return makeAddrString(c.address, c.port)
+}
+
+func (c *Configuration) metricsAddrString() string {
+	return makeAddrString(c.address, c.metricsPort)
+}
+
+func (c *Configuration) pprofAddrString() string {
+	return makeAddrString(c.address, c.pprofPort)
+}
+
+// Configuration parameters passed from the CLI via flags
+var config Configuration
+
 // Global counter channel to track lines across all connections
 var linecounter = make(chan WriterStats)
 var pCounterRecords = prometheus.NewCounter(prometheus.CounterOpts{
@@ -25,6 +67,17 @@ var pCounterBytes = prometheus.NewCounter(prometheus.CounterOpts{
 	Name: "received_bytes_total",
 	Help: "The total number of bytes received and subsequently discarded",
 })
+
+func init() {
+	flag.BoolVar(&config.logIntervalReports, "log.interval.reports", DefaultLogIntervalReports, "Should interval reports be generated")
+	flag.DurationVar(&config.reportInterval, "report.interval", DefaultReportInterval, "Interval between reporting periods")
+	flag.StringVar(&config.address, "address", DefaultAddress, "Listen address")
+	flag.UintVar(&config.port, "port", DefaultPort, "Port used for incoming data")
+	flag.UintVar(&config.metricsPort, "metrics.port", DefaultMetricsPort, "Port used to query metrics")
+	flag.UintVar(&config.pprofPort, "pprof.port", DefaultPprofPort, "Port used to obtain profiling data")
+
+	flag.Parse()
+}
 
 func checkErr(err error) bool {
 	if err == nil {
@@ -87,30 +140,49 @@ func (m *MockWriter) Write(p []byte) (n int, err error) {
 	return stats.nbytes, nil
 }
 
-func aggregator(c chan WriterStats, shutdown chan struct{}) {
-	// Counter is private to aggregator, since it is not used anywhere else.
+type Counter struct {
+	prev      int
+	prevBytes int
+	cur       int
+	curBytes  int
+	t         time.Time
+	pBytes    prometheus.Counter
+	pRecords  prometheus.Counter
+}
+
+func (c *Counter) IncrBy(nlines, nbytes int) {
+	c.cur += nlines
+	c.curBytes += nbytes
+	pCounterRecords.Add(float64(nlines))
+	pCounterBytes.Add(float64(nbytes))
+}
+
+func (c *Counter) UpdatePrev() {
+	c.prev = c.cur
+	c.prevBytes = c.curBytes
+	c.t = time.Now()
+}
+
+func aggregator(
+	config Configuration,
+	c chan WriterStats,
+	shutdown chan struct{}) {
+
+	// Every config.reportInterval produce a summary with totals and rates
+	reportTicker := time.NewTicker(config.reportInterval)
+
 	// This structure is persistent, only one instance exists and it is mutated
 	// each time through the loop.
-	type Counter struct {
-		prev      int
-		prevBytes int
-		cur       int
-		curBytes  int
-		t         time.Time
-	}
-	// Every 10 seconds produce a summary with totals and rates
-	ticker := time.NewTicker(10 * time.Second)
-	var counter = Counter{
-		t: time.Now(),
+	var counter = &Counter{
+		t:        time.Now(),
+		pRecords: pCounterRecords,
+		pBytes:   pCounterBytes,
 	}
 	for {
 		select {
 		case v := <-c:
-			counter.cur += v.nlines
-			counter.curBytes += v.nbytes
-			pCounterRecords.Add(float64(v.nlines))
-			pCounterBytes.Add(float64(v.nbytes))
-		case <-ticker.C:
+			counter.IncrBy(v.nlines, v.nbytes)
+		case <-reportTicker.C:
 			prev := counter.prev
 			prevBytes := counter.prevBytes
 			cur := counter.cur
@@ -118,10 +190,10 @@ func aggregator(c chan WriterStats, shutdown chan struct{}) {
 			delta := time.Now().Sub(counter.t)
 			rateLines := float64(cur-prev) / delta.Seconds()
 			rateBytes := float64(curBytes-prevBytes) / delta.Seconds()
-			log.Printf("lines/s: %f bytes/s: %f total lines: %d bytes: %d", rateLines, rateBytes, cur, curBytes)
-			counter.prev = counter.cur
-			counter.prevBytes = counter.curBytes
-			counter.t = time.Now()
+			counter.UpdatePrev()
+			if config.logIntervalReports {
+				log.Printf("lines/s: %f bytes/s: %f total lines: %d bytes: %d", rateLines, rateBytes, cur, curBytes)
+			}
 		case <-shutdown:
 			return
 		}
@@ -130,6 +202,7 @@ func aggregator(c chan WriterStats, shutdown chan struct{}) {
 
 func main() {
 	// setLimit()
+
 	signalChan := make(chan os.Signal, 1)
 	shutdown := make(chan struct{})
 	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
@@ -145,22 +218,22 @@ func main() {
 	prometheus.MustRegister(pCounterBytes)
 	prometheus.MustRegister(pCounterRecords)
 
-	go aggregator(linecounter, shutdown)
+	go aggregator(config, linecounter, shutdown)
 
-	ln, err := net.Listen("tcp", ":5002")
+	ln, err := net.Listen("tcp", config.sinkAddrString())
 	if err != nil {
 		panic(err)
 	}
 
 	go func() {
-		if err := http.ListenAndServe(":6060", nil); err != nil {
+		if err := http.ListenAndServe(config.pprofAddrString(), nil); err != nil {
 			log.Fatalf("pprof failed: %v", err)
 		}
 	}()
 
 	go func() {
 		http.Handle("/metrics", promhttp.Handler())
-		if err := http.ListenAndServe(":9094", nil); err != nil {
+		if err := http.ListenAndServe(config.metricsAddrString(), nil); err != nil {
 			log.Fatalf("prom failed: %v", err)
 		}
 	}()
