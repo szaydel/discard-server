@@ -68,6 +68,11 @@ var pCounterBytes = prometheus.NewCounter(prometheus.CounterOpts{
 	Help: "The total number of bytes received and subsequently discarded",
 })
 
+var pCounterActiveSecs = prometheus.NewCounter(prometheus.CounterOpts{
+	Name: "active_seconds_total",
+	Help: "The total number of seconds spent in reading and counting records",
+})
+
 func init() {
 	flag.BoolVar(&config.logIntervalReports, "log.interval.reports", DefaultLogIntervalReports, "Should interval reports be generated")
 	flag.DurationVar(&config.reportInterval, "report.interval", DefaultReportInterval, "Interval between reporting periods")
@@ -115,8 +120,9 @@ func checkErr(err error) bool {
 // WriterStats tracks the number of lines and bytes "written" during a single
 // invocation of the Write method on MockWriter.
 type WriterStats struct {
-	nbytes int
-	nlines int
+	nbytes   int
+	nlines   int
+	duration time.Duration
 }
 
 // MockWriter is an implemention of writer lacking a persistence layer.
@@ -127,8 +133,9 @@ type MockWriter struct {
 // Write implements the Writer interface, but does not actually persist data,
 // instead just counting lines and bytes.
 func (m *MockWriter) Write(p []byte) (n int, err error) {
+	var start time.Time
 	var stats WriterStats
-
+	start = time.Now()
 	for _, v := range p {
 		stats.nbytes++ // count bytes
 		if v == '\n' {
@@ -136,30 +143,37 @@ func (m *MockWriter) Write(p []byte) (n int, err error) {
 		}
 	}
 
+	stats.duration = time.Now().Sub(start)
 	m.statsChan <- stats
 	return stats.nbytes, nil
 }
 
 type Counter struct {
-	prev      int
-	prevBytes int
-	cur       int
-	curBytes  int
-	t         time.Time
-	pBytes    prometheus.Counter
-	pRecords  prometheus.Counter
+	prev           int // cur - prev ==> records / interval
+	prevBytes      int // curBytes - prevBytes ==> bytes / interval
+	cur            int
+	curBytes       int
+	curActiveSecs  float64
+	prevActiveSecs float64
+	t              time.Time
+	pRecords       prometheus.Counter
+	pBytes         prometheus.Counter
+	pActiveSecs    prometheus.Counter
 }
 
-func (c *Counter) IncrBy(nlines, nbytes int) {
+func (c *Counter) IncrBy(nlines, nbytes int, active float64) {
 	c.cur += nlines
 	c.curBytes += nbytes
-	pCounterRecords.Add(float64(nlines))
-	pCounterBytes.Add(float64(nbytes))
+	c.curActiveSecs += active
+	c.pRecords.Add(float64(nlines))
+	c.pBytes.Add(float64(nbytes))
+	c.pActiveSecs.Add(active)
 }
 
 func (c *Counter) UpdatePrev() {
 	c.prev = c.cur
 	c.prevBytes = c.curBytes
+	c.prevActiveSecs = c.curActiveSecs
 	c.t = time.Now()
 }
 
@@ -172,27 +186,37 @@ func aggregator(
 	reportTicker := time.NewTicker(config.reportInterval)
 
 	// This structure is persistent, only one instance exists and it is mutated
-	// each time through the loop.
+	// each time through the loop. The *pCounter* variables are globals.
 	var counter = &Counter{
-		t:        time.Now(),
-		pRecords: pCounterRecords,
-		pBytes:   pCounterBytes,
+		t:           time.Now(),
+		pRecords:    pCounterRecords,
+		pBytes:      pCounterBytes,
+		pActiveSecs: pCounterActiveSecs,
 	}
 	for {
 		select {
 		case v := <-c:
-			counter.IncrBy(v.nlines, v.nbytes)
+			counter.IncrBy(v.nlines, v.nbytes, v.duration.Seconds())
 		case <-reportTicker.C:
 			prev := counter.prev
 			prevBytes := counter.prevBytes
 			cur := counter.cur
 			curBytes := counter.curBytes
+			prevActiveSecs := counter.prevActiveSecs
+			curActiveSecs := counter.curActiveSecs
 			delta := time.Now().Sub(counter.t)
 			rateLines := float64(cur-prev) / delta.Seconds()
 			rateBytes := float64(curBytes-prevBytes) / delta.Seconds()
+			rateActiveTime := (curActiveSecs - prevActiveSecs) / delta.Seconds()
 			counter.UpdatePrev()
 			if config.logIntervalReports {
-				log.Printf("lines/s: %f bytes/s: %f total lines: %d bytes: %d", rateLines, rateBytes, cur, curBytes)
+				log.Printf(
+					"lines/s: %f\tbytes/s: %f\ttotal\tlines: %d\tbytes: %d\tactive secs/s: %.9f",
+					rateLines,
+					rateBytes,
+					cur,
+					curBytes,
+					rateActiveTime)
 			}
 		case <-shutdown:
 			return
@@ -217,6 +241,7 @@ func main() {
 	// Register counters with the Prometheus registry
 	prometheus.MustRegister(pCounterBytes)
 	prometheus.MustRegister(pCounterRecords)
+	prometheus.MustRegister(pCounterActiveSecs)
 
 	go aggregator(config, linecounter, shutdown)
 
