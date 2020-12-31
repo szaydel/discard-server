@@ -15,20 +15,25 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/szaydel/ratelimit"
 )
 
 const (
-	DefaultReportInterval     = 10 * time.Second
-	DefaultLogIntervalReports = true
-	DefaultAddress            = ""
-	DefaultPort               = 5002
-	DefaultPprofPort          = 6060
-	DefaultMetricsPort        = 9094
+	DefaultReportInterval             = 10 * time.Second
+	DefaultLogIntervalReports         = true
+	DefaultAddress                    = ""
+	DefaultPort                       = 5002
+	DefaultPprofPort                  = 6060
+	DefaultMetricsPort                = 9094
+	MegaByte                  int64   = 1024 * 1024
+	MegaByteF                 float64 = 1024 * 1024
 )
 
 type Configuration struct {
 	reportInterval     time.Duration
 	logIntervalReports bool
+	rateLimitMBps      float64
+	maxBurstCapMB      int64
 	address            string
 	port               uint
 	pprofPort          uint
@@ -54,6 +59,18 @@ func (c *Configuration) pprofAddrString() string {
 	return makeAddrString(c.address, c.pprofPort)
 }
 
+func (c *Configuration) rateLimit() float64 {
+	return c.rateLimitMBps * MegaByteF
+}
+
+func (c *Configuration) maxBurstCap() int64 {
+	return c.maxBurstCapMB * MegaByte
+}
+
+func (c *Configuration) isRateLimited() bool {
+	return c.rateLimitMBps > 0 && c.maxBurstCapMB > 0
+}
+
 // Configuration parameters passed from the CLI via flags
 var config Configuration
 
@@ -76,12 +93,23 @@ var pCounterActiveSecs = prometheus.NewCounter(prometheus.CounterOpts{
 func init() {
 	flag.BoolVar(&config.logIntervalReports, "log.interval.reports", DefaultLogIntervalReports, "Should interval reports be generated")
 	flag.DurationVar(&config.reportInterval, "report.interval", DefaultReportInterval, "Interval between reporting periods")
+	flag.Float64Var(&config.rateLimitMBps, "rate.limit", 0, "Rate-limiting to this many MB/s, zero means unlimited")
+	flag.Int64Var(&config.maxBurstCapMB, "max.burst.capacity", 0, "Peak rate-limited capacity in MB allowed, zero means unlimited")
 	flag.StringVar(&config.address, "address", DefaultAddress, "Listen address")
 	flag.UintVar(&config.port, "port", DefaultPort, "Port used for incoming data")
 	flag.UintVar(&config.metricsPort, "metrics.port", DefaultMetricsPort, "Port used to query metrics")
 	flag.UintVar(&config.pprofPort, "pprof.port", DefaultPprofPort, "Port used to obtain profiling data")
 
 	flag.Parse()
+
+	// If maximum burst capacity was not set, but the rate limit was set, adjust
+	// capacity to be equal to rate limit. This means that the bucket will at
+	// most hold tokens equal to number of bytes in the chosen rate.
+	if config.maxBurstCap() < int64(config.rateLimit()) {
+		fmt.Fprint(os.Stderr,
+			"Setting maximum burst capacity equal to rate limit\n")
+		config.maxBurstCapMB = int64(config.rateLimitMBps)
+	}
 }
 
 func checkErr(err error) bool {
@@ -275,16 +303,31 @@ func main() {
 			return
 		}
 
-		go handleConn(conn)
+		go handleConn(conn, &config)
 	}
 }
 
-func handleConn(conn net.Conn) {
+func handleConn(conn net.Conn, config *Configuration) {
 	defer func() {
 		log.Printf("Closing connection %v -> %v", conn.RemoteAddr(), conn.LocalAddr())
 		conn.Close()
 	}()
-	w := &MockWriter{statsChan: linecounter}
+
+	var w io.Writer
+	// Optionally create a rate-limited writer, if the command line arguments
+	// were passed specifying rate limit (and possibly maximum capacity).
+	if config.isRateLimited() {
+		bucket := ratelimit.NewBucketWithRate(
+			config.rateLimit(), config.maxBurstCap())
+		log.Printf("Connection %v -> %v [rate limit = %f MB/s | burst = %d MB]",
+			conn.RemoteAddr(), conn.LocalAddr(),
+			config.rateLimitMBps, config.maxBurstCapMB)
+		w = ratelimit.Writer(&MockWriter{statsChan: linecounter}, bucket)
+	} else {
+		log.Printf("Connection %v -> %v", conn.RemoteAddr(), conn.LocalAddr())
+		w = &MockWriter{statsChan: linecounter}
+	}
+
 	for {
 		n, err := io.Copy(w, conn)
 		switch {
