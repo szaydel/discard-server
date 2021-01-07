@@ -32,8 +32,10 @@ const (
 type Configuration struct {
 	reportInterval     time.Duration
 	logIntervalReports bool
-	rateLimitMBps      float64
-	maxBurstCapMB      int64
+	rateLimitRdrMBps   float64
+	maxBurstCapRdrMB   int64
+	rateLimitWrMBps    float64
+	maxBurstCapWrMB    int64
 	address            string
 	port               uint
 	pprofPort          uint
@@ -59,23 +61,35 @@ func (c *Configuration) pprofAddrString() string {
 	return makeAddrString(c.address, c.pprofPort)
 }
 
-func (c *Configuration) rateLimit() float64 {
-	return c.rateLimitMBps * MegaByteF
+func (c *Configuration) rateLimitRdr() float64 {
+	return c.rateLimitRdrMBps * MegaByteF
 }
 
-func (c *Configuration) maxBurstCap() int64 {
-	return c.maxBurstCapMB * MegaByte
+func (c *Configuration) maxBurstCapRdr() int64 {
+	return c.maxBurstCapRdrMB * MegaByte
 }
 
-func (c *Configuration) isRateLimited() bool {
-	return c.rateLimitMBps > 0 && c.maxBurstCapMB > 0
+func (c *Configuration) rateLimitWr() float64 {
+	return c.rateLimitWrMBps * MegaByteF
+}
+
+func (c *Configuration) maxBurstCapWr() int64 {
+	return c.maxBurstCapWrMB * MegaByte
+}
+
+func (c *Configuration) isRateLimitedRdr() bool {
+	return c.rateLimitRdrMBps > 0 && c.maxBurstCapRdrMB > 0
+}
+
+func (c *Configuration) isRateLimitedWr() bool {
+	return c.rateLimitWrMBps > 0 && c.maxBurstCapWrMB > 0
 }
 
 // Configuration parameters passed from the CLI via flags
 var config Configuration
 
 // Global counter channel to track lines across all connections
-var linecounter = make(chan WriterStats)
+var linecounter = make(chan WriterStats, 100)
 var pCounterRecords = prometheus.NewCounter(prometheus.CounterOpts{
 	Name: "received_records_total",
 	Help: "The total number of records received and subsequently discarded",
@@ -93,8 +107,10 @@ var pCounterActiveSecs = prometheus.NewCounter(prometheus.CounterOpts{
 func init() {
 	flag.BoolVar(&config.logIntervalReports, "log.interval.reports", DefaultLogIntervalReports, "Should interval reports be generated")
 	flag.DurationVar(&config.reportInterval, "report.interval", DefaultReportInterval, "Interval between reporting periods")
-	flag.Float64Var(&config.rateLimitMBps, "rate.limit", 0, "Rate-limiting to this many MB/s, zero means unlimited")
-	flag.Int64Var(&config.maxBurstCapMB, "max.burst.capacity", 0, "Peak rate-limited capacity in MB allowed, zero means unlimited")
+	flag.Float64Var(&config.rateLimitRdrMBps, "rate.limit.in", 0, "Rate-limiting inbound to this many MB/s, zero means unlimited")
+	flag.Int64Var(&config.maxBurstCapRdrMB, "max.burst.cap.in", 0, "Burst capacity in MB allowed inbound, (0 means use rate.limit.in)")
+	flag.Float64Var(&config.rateLimitWrMBps, "rate.limit.out", 0, "Rate-limiting outbound to this many MB/s, zero means unlimited")
+	flag.Int64Var(&config.maxBurstCapWrMB, "max.burst.cap.out", 0, "Burst capacity in MB allowed outbound, (0 means use rate.limit.out)")
 	flag.StringVar(&config.address, "address", DefaultAddress, "Listen address")
 	flag.UintVar(&config.port, "port", DefaultPort, "Port used for incoming data")
 	flag.UintVar(&config.metricsPort, "metrics.port", DefaultMetricsPort, "Port used to query metrics")
@@ -105,10 +121,15 @@ func init() {
 	// If maximum burst capacity was not set, but the rate limit was set, adjust
 	// capacity to be equal to rate limit. This means that the bucket will at
 	// most hold tokens equal to number of bytes in the chosen rate.
-	if config.maxBurstCap() < int64(config.rateLimit()) {
+	if config.maxBurstCapRdrMB < int64(config.rateLimitRdr()) {
 		fmt.Fprint(os.Stderr,
-			"Setting maximum burst capacity equal to rate limit\n")
-		config.maxBurstCapMB = int64(config.rateLimitMBps)
+			"Setting maximum burst capacity inbound equal to rate limit\n")
+		config.maxBurstCapRdrMB = int64(config.rateLimitRdrMBps)
+	}
+	if config.maxBurstCapWrMB < int64(config.rateLimitWr()) {
+		fmt.Fprint(os.Stderr,
+			"Setting maximum burst capacity outbound equal to rate limit\n")
+		config.maxBurstCapWrMB = int64(config.rateLimitWrMBps)
 	}
 }
 
@@ -171,7 +192,7 @@ func (m *MockWriter) Write(p []byte) (n int, err error) {
 		}
 	}
 
-	stats.duration = time.Now().Sub(start)
+	stats.duration = time.Since(start)
 	m.statsChan <- stats
 	return stats.nbytes, nil
 }
@@ -189,6 +210,7 @@ type Counter struct {
 	pActiveSecs    prometheus.Counter
 }
 
+// IncrBy increments the lines, bytes and active seconds counters.
 func (c *Counter) IncrBy(nlines, nbytes int, active float64) {
 	c.cur += nlines
 	c.curBytes += nbytes
@@ -198,6 +220,9 @@ func (c *Counter) IncrBy(nlines, nbytes int, active float64) {
 	c.pActiveSecs.Add(active)
 }
 
+// UpdatePrev sets the previous values to current values, which happens before
+// the current values are updated. The delta between current and previous is
+// effectively the amount of work during the last interval.
 func (c *Counter) UpdatePrev() {
 	c.prev = c.cur
 	c.prevBytes = c.curBytes
@@ -232,7 +257,7 @@ func aggregator(
 			curBytes := counter.curBytes
 			prevActiveSecs := counter.prevActiveSecs
 			curActiveSecs := counter.curActiveSecs
-			delta := time.Now().Sub(counter.t)
+			delta := time.Since(counter.t)
 			rateLines := float64(cur-prev) / delta.Seconds()
 			rateBytes := float64(curBytes-prevBytes) / delta.Seconds()
 			rateActiveTime := (curActiveSecs - prevActiveSecs) / delta.Seconds()
@@ -307,29 +332,58 @@ func main() {
 	}
 }
 
+// RateLimitedReader wraps an io.Reader in a new rate-limited io.Reader.
+func RateLimitedReader(r io.Reader, config *Configuration) io.Reader {
+	if !config.isRateLimitedRdr() {
+		return r
+	}
+	return ratelimit.Reader(r,
+		ratelimit.NewBucketWithRate(
+			config.rateLimitRdr(),
+			config.maxBurstCapRdr()))
+}
+
+// RateLimitedWriter wraps an io.Writer in a new rate-limited io.Writer.
+func RateLimitedWriter(w io.Writer, config *Configuration) io.Writer {
+	if !config.isRateLimitedWr() {
+		return w
+	}
+	return ratelimit.Writer(w,
+		ratelimit.NewBucketWithRate(
+			config.rateLimitWr(),
+			config.maxBurstCapWr()))
+}
+
+// WriteConnInfo puts out a connection information message with optional rate
+// limiting details.
+func WriteConnInfo(conn net.Conn, config *Configuration) {
+	if config.isRateLimitedRdr() || config.isRateLimitedWr() {
+		log.Printf("Connection rate-limited %v -> %v [inbound %f MB/s | %d MB] [outbound = %f MB/s | %d MB]",
+			conn.RemoteAddr(), conn.LocalAddr(),
+			config.rateLimitRdrMBps, config.maxBurstCapRdrMB,
+			config.rateLimitWrMBps, config.maxBurstCapWrMB)
+	} else {
+		log.Printf("Connection %v -> %v", conn.RemoteAddr(), conn.LocalAddr())
+	}
+}
+
 func handleConn(conn net.Conn, config *Configuration) {
 	defer func() {
 		log.Printf("Closing connection %v -> %v", conn.RemoteAddr(), conn.LocalAddr())
 		conn.Close()
 	}()
 
-	var w io.Writer
-	// Optionally create a rate-limited writer, if the command line arguments
-	// were passed specifying rate limit (and possibly maximum capacity).
-	if config.isRateLimited() {
-		bucket := ratelimit.NewBucketWithRate(
-			config.rateLimit(), config.maxBurstCap())
-		log.Printf("Connection %v -> %v [rate limit = %f MB/s | burst = %d MB]",
-			conn.RemoteAddr(), conn.LocalAddr(),
-			config.rateLimitMBps, config.maxBurstCapMB)
-		w = ratelimit.Writer(&MockWriter{statsChan: linecounter}, bucket)
-	} else {
-		log.Printf("Connection %v -> %v", conn.RemoteAddr(), conn.LocalAddr())
-		w = &MockWriter{statsChan: linecounter}
-	}
+	// Optionally create a rate-limited reader and/or writer, if the command
+	// line arguments were passed specifying rate limit (and possibly maximum
+	// capacity).
+	var r io.Reader = RateLimitedReader(conn, config)
+	var w io.Writer = RateLimitedWriter(
+		&MockWriter{statsChan: linecounter}, config)
+
+	WriteConnInfo(conn, config)
 
 	for {
-		n, err := io.Copy(w, conn)
+		n, err := io.Copy(w, r)
 		switch {
 		case n == 0:
 			if err != nil {
